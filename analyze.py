@@ -22,10 +22,10 @@ from anthropic import Anthropic
 # ── Config ────────────────────────────────────────────────────────────────────
 GAMMA_API   = "https://gamma-api.polymarket.com"
 MODEL       = "claude-sonnet-4-6"
-MIN_PROB    = 0.85
+MIN_PROB    = 0.55
 MAX_PROB    = 0.97
 MIN_LIQUID  = 1_000     # USD liquidity floor
-MAX_MARKETS = 20        # top N by liquidity sent to Claude
+MAX_MARKETS = 15        # top N by liquidity sent to Claude
 BET_SIZE    = 10.0      # hypothetical bet (USD)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -305,6 +305,16 @@ def run_with_web_search(client: Anthropic, prompt: str) -> str:
     return ""
 
 
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences and return stripped text."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("```")[1]
+        if t.startswith("json"):
+            t = t[4:]
+    return t.strip()
+
+
 def run_without_tools(client: Anthropic, prompt: str) -> str:
     """Fallback: call Claude without web search tools."""
     response = client.messages.create(
@@ -323,26 +333,20 @@ def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
         print(f"  [{i}/{len(markets)}] {title[:70]}…", flush=True)
         try:
             raw = run_with_web_search(client, build_prompt(market))
-            # Strip accidental markdown fences
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            raw = raw.strip()
+            raw = _strip_fences(raw)
             if not raw:
-                # Web-search loop returned no text block — retry without tools
                 print("    ↺ Empty web-search response, retrying without tools…", flush=True)
-                raw = run_without_tools(client, build_prompt(market)).strip()
-                if raw.startswith("```"):
-                    raw = raw.split("```")[1]
-                    if raw.startswith("json"):
-                        raw = raw[4:]
-                raw = raw.strip()
+                raw = _strip_fences(run_without_tools(client, build_prompt(market)))
             if not raw:
-                raise ValueError("No text content returned from Claude")
-            analysis = json.loads(raw)
+                raise ValueError("Claude returned no text content in either attempt")
+            try:
+                analysis = json.loads(raw)
+            except json.JSONDecodeError as jexc:
+                print(f"    ⚠ JSON parse error ({jexc}). Raw response was:", file=sys.stderr)
+                print(f"    >>>  {raw!r}", file=sys.stderr)
+                raise
         except Exception as exc:
-            print(f"    ⚠ Analysis error: {exc}", file=sys.stderr)
+            print(f"    ⚠ Analysis failed: {exc}", file=sys.stderr)
             analysis = {"claude_prob": None, "reasoning": str(exc), "edge_direction": "FAIR"}
 
         market["_analysis"] = analysis
