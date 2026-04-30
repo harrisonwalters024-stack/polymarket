@@ -16,18 +16,16 @@ import time
 import textwrap
 import argparse
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from anthropic import Anthropic
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GAMMA_API   = "https://gamma-api.polymarket.com"
 MODEL       = "claude-sonnet-4-6"
-MIN_PROB    = 0.55
+MIN_PROB    = 0.40
 MAX_PROB    = 0.97
-MIN_LIQUID  = 1_000     # USD liquidity floor
 MAX_MARKETS = 15        # top N by liquidity sent to Claude
-BET_SIZE     = 10.0     # hypothetical bet (USD)
-RESOLVE_DAYS = 3        # only markets resolving within this many days
+BET_SIZE    = 10.0      # hypothetical bet (USD)
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 # Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment.
@@ -265,10 +263,8 @@ def normalise_price(raw_price: float | None) -> float | None:
 
 
 def filter_markets(markets: list[dict]) -> list[dict]:
-    """Keep markets resolving within RESOLVE_DAYS with YES in [MIN_PROB, MAX_PROB]
-    and enough liquidity. Returns the top MAX_MARKETS sorted soonest-first."""
-    now      = datetime.now(timezone.utc)
-    deadline = now + timedelta(days=RESOLVE_DAYS)
+    """Keep markets with YES in [MIN_PROB, MAX_PROB].
+    Returns the top MAX_MARKETS by liquidity descending."""
     out = []
     for m in markets:
         price = normalise_price(yes_price(m))
@@ -276,16 +272,11 @@ def filter_markets(markets: list[dict]) -> list[dict]:
             continue
         if not (MIN_PROB <= price <= MAX_PROB):
             continue
-        if liquidity_usd(m) < MIN_LIQUID:
-            continue
-        end_dt = resolve_date(m)
-        if end_dt is None or end_dt < now or end_dt > deadline:
-            continue
         m["_top_price"] = price
-        m["_end_date"]  = end_dt
+        m["_end_date"]  = resolve_date(m)
         out.append(m)
 
-    out.sort(key=lambda m: m["_end_date"])
+    out.sort(key=lambda m: liquidity_usd(m), reverse=True)
     return out[:MAX_MARKETS]
 
 
@@ -453,8 +444,7 @@ def render_dashboard(markets: list[dict]) -> None:
     print(BOLD + CYAN + "╚" + "═" * (W - 2) + "╝" + RESET)
     print(f"{DIM}  {time.strftime('%Y-%m-%d %H:%M:%S')}   "
           f"Filter: {MIN_PROB:.0%}–{MAX_PROB:.0%} YES   "
-          f"Resolves within {RESOLVE_DAYS}d   "
-          f"Top {MAX_MARKETS} soonest   "
+          f"Top {MAX_MARKETS} by liquidity   "
           f"Model: {MODEL}   "
           f"Bet size: ${BET_SIZE:.0f}{RESET}")
     print()
