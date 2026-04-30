@@ -573,30 +573,9 @@ def main() -> None:
             )
         print(f"  Retrieved {len(raw_markets)} markets.")
 
-        # ── Diagnostic: show raw price data for first 20 markets ──────────────
-        print(f"\n{DIM}  Diagnostic — first 20 raw markets (before filter):{RESET}")
-        print(f"  {'#':>3}  {'YES price':>12}  {'norm':>6}  {'outcomes':<20}  {'outcomePrices':<30}  question")
-        print("  " + "─" * 110)
-        for di, dm in enumerate(raw_markets[:20], 1):
-            raw_p    = yes_price(dm)
-            norm_p   = normalise_price(raw_p)
-            outcomes = str(dm.get("outcomes", ""))[:18]
-            op       = str(dm.get("outcomePrices") or dm.get("outcome_prices", ""))[:28]
-            q        = (dm.get("question") or dm.get("title") or "")[:50]
-            raw_str  = f"{raw_p:8.4f}" if raw_p is not None else "    None"
-            norm_str = f"{norm_p:.4f}" if norm_p is not None else "  None"
-            print(f"  {di:>3}  {raw_str:>12}  {norm_str:>6}  {outcomes:<20}  {op:<30}  {q}")
-        print()
-        # ─────────────────────────────────────────────────────────────────────
-
         markets = filter_markets(raw_markets)
         if not markets:
-            print(
-                f"\nNo markets matched (YES {MIN_PROB:.0%}–{MAX_PROB:.0%}, "
-                f"liquidity ≥ ${MIN_LIQUID:,}).\n"
-                "Try lowering MIN_LIQUID or widening the probability band "
-                "in the config section.\n"
-            )
+            print(f"\nNo markets matched (YES {MIN_PROB:.0%}–{MAX_PROB:.0%}).\n")
             return
         print(f"  {len(markets)} markets passed filter.")
 
