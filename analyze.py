@@ -26,7 +26,8 @@ MIN_PROB    = 0.55
 MAX_PROB    = 0.97
 MIN_LIQUID  = 1_000     # USD liquidity floor
 MAX_MARKETS = 15        # top N by liquidity sent to Claude
-BET_SIZE    = 10.0      # hypothetical bet (USD)
+BET_SIZE     = 10.0     # hypothetical bet (USD)
+RESOLVE_DAYS = 3        # only markets resolving within this many days
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -203,8 +204,10 @@ def normalise_price(raw_price: float | None) -> float | None:
 
 
 def filter_markets(markets: list[dict]) -> list[dict]:
-    """Keep markets with a YES outcome in [MIN_PROB, MAX_PROB] and enough
-    liquidity. Returns the top MAX_MARKETS by liquidity descending."""
+    """Keep markets resolving within RESOLVE_DAYS with YES in [MIN_PROB, MAX_PROB]
+    and enough liquidity. Returns the top MAX_MARKETS sorted soonest-first."""
+    now      = datetime.now(timezone.utc)
+    deadline = now + timedelta(days=RESOLVE_DAYS)
     out = []
     for m in markets:
         price = normalise_price(yes_price(m))
@@ -214,11 +217,14 @@ def filter_markets(markets: list[dict]) -> list[dict]:
             continue
         if liquidity_usd(m) < MIN_LIQUID:
             continue
+        end_dt = resolve_date(m)
+        if end_dt is None or end_dt < now or end_dt > deadline:
+            continue
         m["_top_price"] = price
-        m["_end_date"]  = resolve_date(m)
+        m["_end_date"]  = end_dt
         out.append(m)
 
-    out.sort(key=lambda m: liquidity_usd(m), reverse=True)
+    out.sort(key=lambda m: m["_end_date"])
     return out[:MAX_MARKETS]
 
 
@@ -333,17 +339,20 @@ def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
         print(f"  [{i}/{len(markets)}] {title[:70]}…", flush=True)
         try:
             raw = run_with_web_search(client, build_prompt(market))
+            print(f"    RAW (web-search):  {raw!r}", file=sys.stderr)
             raw = _strip_fences(raw)
             if not raw:
                 print("    ↺ Empty web-search response, retrying without tools…", flush=True)
-                raw = _strip_fences(run_without_tools(client, build_prompt(market)))
+                raw2 = run_without_tools(client, build_prompt(market))
+                print(f"    RAW (no-tools):    {raw2!r}", file=sys.stderr)
+                raw = _strip_fences(raw2)
             if not raw:
                 raise ValueError("Claude returned no text content in either attempt")
             try:
                 analysis = json.loads(raw)
             except json.JSONDecodeError as jexc:
-                print(f"    ⚠ JSON parse error ({jexc}). Raw response was:", file=sys.stderr)
-                print(f"    >>>  {raw!r}", file=sys.stderr)
+                print(f"    ⚠ JSON parse error: {jexc}", file=sys.stderr)
+                print(f"    ⚠ Stripped text:    {raw!r}", file=sys.stderr)
                 raise
         except Exception as exc:
             print(f"    ⚠ Analysis failed: {exc}", file=sys.stderr)
@@ -383,7 +392,8 @@ def render_dashboard(markets: list[dict]) -> None:
     print(BOLD + CYAN + "╚" + "═" * (W - 2) + "╝" + RESET)
     print(f"{DIM}  {time.strftime('%Y-%m-%d %H:%M:%S')}   "
           f"Filter: {MIN_PROB:.0%}–{MAX_PROB:.0%} YES   "
-          f"Top {MAX_MARKETS} by liquidity   "
+          f"Resolves within {RESOLVE_DAYS}d   "
+          f"Top {MAX_MARKETS} soonest   "
           f"Model: {MODEL}   "
           f"Bet size: ${BET_SIZE:.0f}{RESET}")
     print()
