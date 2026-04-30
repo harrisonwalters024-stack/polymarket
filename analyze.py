@@ -29,6 +29,11 @@ MAX_MARKETS = 15        # top N by liquidity sent to Claude
 BET_SIZE     = 10.0     # hypothetical bet (USD)
 RESOLVE_DAYS = 3        # only markets resolving within this many days
 
+# ── Telegram ──────────────────────────────────────────────────────────────────
+# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment.
+# If either is absent the script still runs — notifications are silently skipped.
+TELEGRAM_API = "https://api.telegram.org"
+
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
@@ -187,6 +192,62 @@ def resolve_date(market: dict) -> datetime | None:
             except (ValueError, TypeError):
                 pass
     return None
+
+
+def _tg_send(token: str, chat_id: str, text: str) -> None:
+    """Fire-and-forget Telegram sendMessage. Errors are printed but never fatal."""
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API}/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        if not resp.ok:
+            print(f"  [Telegram] send failed: {resp.status_code} {resp.text[:120]}", file=sys.stderr)
+    except requests.RequestException as exc:
+        print(f"  [Telegram] request error: {exc}", file=sys.stderr)
+
+
+def notify_edge(token: str, chat_id: str, market: dict) -> None:
+    a         = market["_analysis"]
+    direction = a.get("edge_direction", "?")
+    c_prob    = a.get("claude_prob")
+    mkt_prob  = market["_top_price"]
+    title     = market.get("question") or market.get("title") or "Unknown"
+    end_dt    = market.get("_end_date")
+    end_str   = end_dt.strftime("%Y-%m-%d") if end_dt else "?"
+    diff      = (c_prob - mkt_prob) if c_prob is not None else 0
+    ev        = expected_value(mkt_prob, c_prob, BET_SIZE) if c_prob is not None else 0
+    arrow     = "📈" if direction == "OVER" else "📉"
+    text = (
+        f"{arrow} <b>EDGE: {direction}</b>\n"
+        f"<b>{title}</b>\n\n"
+        f"Resolves: {end_str}\n"
+        f"Market YES:  {mkt_prob:.1%}\n"
+        f"Claude YES:  {c_prob:.1%}\n"
+        f"Delta:       {diff:+.1%}\n"
+        f"EV (${BET_SIZE:.0f} bet): ${ev:+.2f}\n\n"
+        f"<i>{a.get('reasoning', '')}</i>"
+    )
+    _tg_send(token, chat_id, text)
+
+
+def notify_summary(token: str, chat_id: str, markets: list[dict]) -> None:
+    total      = len(markets)
+    edge_mkts  = [m for m in markets if m["_analysis"].get("edge_direction") != "FAIR"]
+    lines      = [f"🔎 <b>Polymarket scan complete</b> — {time.strftime('%Y-%m-%d %H:%M')}"]
+    lines.append(f"Markets analyzed: {total}  |  Edges found: {len(edge_mkts)}\n")
+    for m in edge_mkts:
+        a   = m["_analysis"]
+        d   = a.get("edge_direction", "?")
+        cp  = a.get("claude_prob")
+        mp  = m["_top_price"]
+        ev  = expected_value(mp, cp, BET_SIZE) if cp is not None else 0
+        ttl = (m.get("question") or m.get("title") or "")[:60]
+        lines.append(f"[{d}] {ttl}  EV ${ev:+.2f}")
+    if not edge_mkts:
+        lines.append("No edges flagged — all markets near fair value.")
+    _tg_send(token, chat_id, "\n".join(lines))
 
 
 def normalise_price(raw_price: float | None) -> float | None:
@@ -549,9 +610,24 @@ def main() -> None:
             return
         print(f"  {len(markets)} markets passed filter.")
 
+    tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    tg_enabled = bool(tg_token and tg_chat_id)
+    if tg_enabled:
+        print(f"{DIM}  Telegram notifications enabled (chat {tg_chat_id}){RESET}")
+    else:
+        print(f"{DIM}  Telegram disabled — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to enable{RESET}")
+
     print(BOLD + CYAN + f"\nRunning Claude analysis with web search ({MODEL})…" + RESET, flush=True)
     analyzed = analyze_markets(client, markets)
     render_dashboard(analyzed)
+
+    if tg_enabled:
+        print(f"\n{DIM}Sending Telegram notifications…{RESET}", flush=True)
+        for m in analyzed:
+            if m["_analysis"].get("edge_direction") != "FAIR":
+                notify_edge(tg_token, tg_chat_id, m)
+        notify_summary(tg_token, tg_chat_id, analyzed)
 
 
 if __name__ == "__main__":
