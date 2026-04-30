@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Polymarket CLOB Market Analyzer
-Fetches active markets, filters for high-confidence YES outcomes (80-95%),
+Fetches active markets, filters for high-confidence YES outcomes (85-97%),
 uses Claude + live web search to estimate true probability, surfaces edges.
 
 Usage:
@@ -20,14 +20,13 @@ from datetime import datetime, timezone, timedelta
 from anthropic import Anthropic
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GAMMA_API           = "https://gamma-api.polymarket.com"
-MODEL               = "claude-sonnet-4-20250514"
-MIN_PROB            = 0.80
-MAX_PROB            = 0.95
-MIN_LIQUID          = 1_000     # USD liquidity floor
-MAX_MARKETS         = 6         # cap sent to Claude
-BET_SIZE            = 10.0      # hypothetical bet (USD)
-MAX_MONTHS_TO_CLOSE = 6         # skip markets resolving more than this far out
+GAMMA_API   = "https://gamma-api.polymarket.com"
+MODEL       = "claude-sonnet-4-6"
+MIN_PROB    = 0.85
+MAX_PROB    = 0.97
+MIN_LIQUID  = 1_000     # USD liquidity floor
+MAX_MARKETS = 20        # top N by liquidity sent to Claude
+BET_SIZE    = 10.0      # hypothetical bet (USD)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -190,16 +189,9 @@ def resolve_date(market: dict) -> datetime | None:
 
 
 def filter_markets(markets: list[dict]) -> list[dict]:
-    """Keep markets that:
-    - have a YES outcome priced in [MIN_PROB, MAX_PROB]
-    - have enough liquidity
-    - resolve within MAX_MONTHS_TO_CLOSE months (skips far-future markets)
-    - haven't already resolved (end date in the past)
-    """
-    now     = datetime.now(timezone.utc)
-    cutoff  = now + timedelta(days=MAX_MONTHS_TO_CLOSE * 30)
-    out     = []
-
+    """Keep markets with a YES outcome in [MIN_PROB, MAX_PROB] and enough
+    liquidity. Returns the top MAX_MARKETS by liquidity descending."""
+    out = []
     for m in markets:
         price = yes_price(m)
         if price is None:
@@ -208,19 +200,11 @@ def filter_markets(markets: list[dict]) -> list[dict]:
             continue
         if liquidity_usd(m) < MIN_LIQUID:
             continue
-
-        end = resolve_date(m)
-        if end is not None:
-            if end < now:
-                continue      # already expired
-            if end > cutoff:
-                continue      # too far out to analyse meaningfully
-
         m["_top_price"] = price
-        m["_end_date"]  = end
+        m["_end_date"]  = resolve_date(m)
         out.append(m)
 
-    out.sort(key=lambda m: m["_top_price"], reverse=True)
+    out.sort(key=lambda m: liquidity_usd(m), reverse=True)
     return out[:MAX_MARKETS]
 
 
@@ -357,7 +341,7 @@ def render_dashboard(markets: list[dict]) -> None:
     print(BOLD + CYAN + "╚" + "═" * (W - 2) + "╝" + RESET)
     print(f"{DIM}  {time.strftime('%Y-%m-%d %H:%M:%S')}   "
           f"Filter: {MIN_PROB:.0%}–{MAX_PROB:.0%} YES   "
-          f"Max horizon: {MAX_MONTHS_TO_CLOSE}mo   "
+          f"Top {MAX_MARKETS} by liquidity   "
           f"Model: {MODEL}   "
           f"Bet size: ${BET_SIZE:.0f}{RESET}")
     print()
@@ -469,13 +453,11 @@ def main() -> None:
         print(f"  Retrieved {len(raw_markets)} markets.")
         markets = filter_markets(raw_markets)
         if not markets:
-            cutoff_str = (datetime.now(timezone.utc) + timedelta(days=MAX_MONTHS_TO_CLOSE * 30)
-                          ).strftime("%Y-%m-%d")
             print(
                 f"\nNo markets matched (YES {MIN_PROB:.0%}–{MAX_PROB:.0%}, "
-                f"liquidity ≥ ${MIN_LIQUID:,}, resolves before {cutoff_str}).\n"
-                "Try lowering MIN_LIQUID, widening the probability band, or "
-                "raising MAX_MONTHS_TO_CLOSE in the config section.\n"
+                f"liquidity ≥ ${MIN_LIQUID:,}).\n"
+                "Try lowering MIN_LIQUID or widening the probability band "
+                "in the config section.\n"
             )
             return
         print(f"  {len(markets)} markets passed filter.")
