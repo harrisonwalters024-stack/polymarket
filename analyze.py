@@ -458,11 +458,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use mock market data (useful when Polymarket API is IP-blocked)",
     )
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print raw JSON of first 5 markets from the API and exit (no filtering, no Claude)",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # ── Debug mode: dump raw API response and exit ─────────────────────────────
+    if args.debug:
+        print(BOLD + YELLOW + "\n[DEBUG MODE] Fetching first 5 markets — raw API JSON:" + RESET, flush=True)
+        try:
+            raw_markets = fetch_markets(limit=5)
+        except requests.RequestException as exc:
+            sys.exit(f"Failed to fetch markets: {exc}")
+        for i, m in enumerate(raw_markets[:5], 1):
+            print(BOLD + CYAN + f"\n{'─'*60}\n  Market #{i}\n{'─'*60}" + RESET)
+            print(json.dumps(m, indent=2, default=str))
+        return
+    # ──────────────────────────────────────────────────────────────────────────
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
