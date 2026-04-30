@@ -192,11 +192,11 @@ def resolve_date(market: dict) -> datetime | None:
     return None
 
 
-def _tg_send(token: str, chat_id: str, text: str) -> None:
+def _tg_send(token: str, chat_id: int, text: str) -> None:
     """Fire-and-forget Telegram sendMessage. Errors are printed but never fatal."""
     try:
         resp = requests.post(
-            f"{TELEGRAM_API}/bot{token}/sendMessage",
+            f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
@@ -206,7 +206,7 @@ def _tg_send(token: str, chat_id: str, text: str) -> None:
         print(f"  [Telegram] request error: {exc}", file=sys.stderr)
 
 
-def notify_edge(token: str, chat_id: str, market: dict) -> None:
+def notify_edge(token: str, chat_id: int, market: dict) -> None:
     a         = market["_analysis"]
     direction = a.get("edge", "?")
     c_prob    = a.get("probability")
@@ -230,7 +230,7 @@ def notify_edge(token: str, chat_id: str, market: dict) -> None:
     _tg_send(token, chat_id, text)
 
 
-def notify_summary(token: str, chat_id: str, markets: list[dict]) -> None:
+def notify_summary(token: str, chat_id: int, markets: list[dict]) -> None:
     total      = len(markets)
     edge_mkts  = [m for m in markets if m["_analysis"].get("edge") != "FAIR"]
     lines      = [f"🔎 <b>Polymarket scan complete</b> — {time.strftime('%Y-%m-%d %H:%M')}"]
@@ -578,7 +578,8 @@ def main() -> None:
         print(f"  {len(markets)} markets passed filter.")
 
     tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    tg_chat_id_raw = os.environ.get("TELEGRAM_CHAT_ID", "")
+    tg_chat_id = int(tg_chat_id_raw) if tg_chat_id_raw else 0
     tg_enabled = bool(tg_token and tg_chat_id)
     if tg_enabled:
         print(f"{DIM}  Telegram notifications enabled (chat {tg_chat_id}){RESET}")
