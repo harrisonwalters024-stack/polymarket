@@ -208,8 +208,8 @@ def _tg_send(token: str, chat_id: str, text: str) -> None:
 
 def notify_edge(token: str, chat_id: str, market: dict) -> None:
     a         = market["_analysis"]
-    direction = a.get("edge_direction", "?")
-    c_prob    = a.get("claude_prob")
+    direction = a.get("edge", "?")
+    c_prob    = a.get("probability")
     mkt_prob  = market["_top_price"]
     title     = market.get("question") or market.get("title") or "Unknown"
     end_dt    = market.get("_end_date")
@@ -232,13 +232,13 @@ def notify_edge(token: str, chat_id: str, market: dict) -> None:
 
 def notify_summary(token: str, chat_id: str, markets: list[dict]) -> None:
     total      = len(markets)
-    edge_mkts  = [m for m in markets if m["_analysis"].get("edge_direction") != "FAIR"]
+    edge_mkts  = [m for m in markets if m["_analysis"].get("edge") != "FAIR"]
     lines      = [f"🔎 <b>Polymarket scan complete</b> — {time.strftime('%Y-%m-%d %H:%M')}"]
     lines.append(f"Markets analyzed: {total}  |  Edges found: {len(edge_mkts)}\n")
     for m in edge_mkts:
         a   = m["_analysis"]
-        d   = a.get("edge_direction", "?")
-        cp  = a.get("claude_prob")
+        d   = a.get("edge", "?")
+        cp  = a.get("probability")
         mp  = m["_top_price"]
         ev  = expected_value(mp, cp, BET_SIZE) if cp is not None else 0
         ttl = (m.get("question") or m.get("title") or "")[:60]
@@ -282,6 +282,13 @@ def filter_markets(markets: list[dict]) -> list[dict]:
 
 # ── Claude + web search ────────────────────────────────────────────────────────
 
+SYSTEM_PROMPT = (
+    "You are a prediction-market analyst. "
+    "You MUST respond with valid JSON only — no preamble, no explanation, no markdown, "
+    "no code fences, no trailing text. Output a single JSON object and nothing else."
+)
+
+
 def build_prompt(market: dict) -> str:
     title    = market.get("question") or market.get("title") or "Unknown"
     criteria = market.get("description") or market.get("resolutionCriteria") or "Not provided"
@@ -290,32 +297,22 @@ def build_prompt(market: dict) -> str:
     end_dt   = market.get("_end_date")
     end_str  = end_dt.strftime("%Y-%m-%d") if end_dt else "unknown"
 
-    return f"""You are a sharp prediction-market analyst with live web search access.
-
-Market question: {title}
+    return f"""Market question: {title}
 
 Resolution criteria: {criteria}
 
 Resolution date: {end_str}
-Market's current YES probability: {price:.1%}
+Market YES probability: {price:.1%}
 Today's date: {time.strftime('%Y-%m-%d')}
 
-INSTRUCTIONS:
-1. Use web search to find current news, data, or recent developments directly relevant to this market. Search for specific facts that move the probability.
-2. Based on what you find, estimate the true probability (0–100%) that this market resolves YES.
-3. Explain your reasoning in 2–3 sentences, citing the evidence you found.
-4. Compare your estimate to the market price and classify the edge.
+Use web search to find current news and data relevant to this market, then estimate the true probability it resolves YES.
 
-After searching, respond ONLY with valid JSON — no markdown fences, no extra keys:
-{{
-  "claude_prob": <float between 0 and 1>,
-  "reasoning": "<2-3 sentence string citing what you found>",
-  "edge_direction": "OVER" | "UNDER" | "FAIR"
-}}
+Respond with ONLY a valid JSON object. No preamble, no markdown, no code fences, no extra text — just the raw JSON:
+{{"probability": <number between 0 and 1>, "reasoning": "<2-3 sentences citing what you found>", "edge": "OVER" | "UNDER" | "FAIR"}}
 
 Definitions:
-- "OVER"  = your estimate is HIGHER than the market (market is cheap — potential buy)
-- "UNDER" = your estimate is LOWER  (market is expensive — avoid)
+- "OVER"  = your probability is higher than the market price (potential value buy)
+- "UNDER" = your probability is lower (overpriced, avoid)
 - "FAIR"  = roughly aligned, no meaningful edge"""
 
 
@@ -334,6 +331,7 @@ def run_with_web_search(client: Anthropic, prompt: str) -> str:
         response = client.messages.create(
             model=MODEL,
             max_tokens=1024,
+            system=SYSTEM_PROMPT,
             tools=tools,
             messages=messages,
         )
@@ -378,6 +376,7 @@ def run_without_tools(client: Anthropic, prompt: str) -> str:
     response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
+        system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
     return next(
@@ -408,7 +407,7 @@ def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
                 raise
         except Exception as exc:
             print(f"    ⚠ Analysis failed: {exc}", file=sys.stderr)
-            analysis = {"claude_prob": None, "reasoning": str(exc), "edge_direction": "FAIR"}
+            analysis = {"probability": None, "reasoning": str(exc), "edge": "FAIR"}
 
         market["_analysis"] = analysis
         time.sleep(0.5)
@@ -449,15 +448,15 @@ def render_dashboard(markets: list[dict]) -> None:
           f"Bet size: ${BET_SIZE:.0f}{RESET}")
     print()
 
-    edge_markets = [m for m in markets if m["_analysis"].get("edge_direction") != "FAIR"]
+    edge_markets = [m for m in markets if m["_analysis"].get("edge") != "FAIR"]
 
     for idx, market in enumerate(markets, 1):
         title     = market.get("question") or market.get("title") or "Unknown"
         mkt_prob  = market["_top_price"]
         analysis  = market["_analysis"]
-        c_prob    = analysis.get("claude_prob")
+        c_prob    = analysis.get("probability")
         reasoning = analysis.get("reasoning", "")
-        direction = analysis.get("edge_direction", "FAIR")
+        direction = analysis.get("edge", "FAIR")
         has_edge  = direction != "FAIR"
         color     = edge_color(direction)
         end_dt    = market.get("_end_date")
@@ -468,7 +467,6 @@ def render_dashboard(markets: list[dict]) -> None:
         print("  " + SEP)
         print(f"  {DIM}Resolves: {end_str}   Liquidity: ${liquidity_usd(market):,.0f}{RESET}")
 
-        # Probability bars — always labelled YES so there's no ambiguity
         print(f"  Market YES    {CYAN}{mkt_prob:5.1%}{RESET}  {CYAN}{prob_bar(mkt_prob)}{RESET}")
         if c_prob is not None:
             diff     = c_prob - mkt_prob
@@ -500,8 +498,8 @@ def render_dashboard(markets: list[dict]) -> None:
     if edge_markets:
         print()
         for m in edge_markets:
-            direction = m["_analysis"].get("edge_direction", "?")
-            c_prob    = m["_analysis"].get("claude_prob")
+            direction = m["_analysis"].get("edge", "?")
+            c_prob    = m["_analysis"].get("probability")
             mkt_prob  = m["_top_price"]
             title     = (m.get("question") or m.get("title") or "Unknown")[:58]
             diff      = (c_prob - mkt_prob) if c_prob is not None else 0
@@ -594,7 +592,7 @@ def main() -> None:
     if tg_enabled:
         print(f"\n{DIM}Sending Telegram notifications…{RESET}", flush=True)
         for m in analyzed:
-            if m["_analysis"].get("edge_direction") != "FAIR":
+            if m["_analysis"].get("edge") != "FAIR":
                 notify_edge(tg_token, tg_chat_id, m)
         notify_summary(tg_token, tg_chat_id, analyzed)
 
