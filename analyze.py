@@ -188,12 +188,26 @@ def resolve_date(market: dict) -> datetime | None:
     return None
 
 
+def normalise_price(raw_price: float | None) -> float | None:
+    """Normalise a price to the [0,1] range.
+
+    Polymarket returns prices as decimals (0.87) but some endpoints or
+    market records occasionally use percentage points (87.0).  Values
+    clearly above 1.0 are divided by 100 before comparison.
+    """
+    if raw_price is None:
+        return None
+    if raw_price > 1.0:
+        raw_price = raw_price / 100.0
+    return raw_price
+
+
 def filter_markets(markets: list[dict]) -> list[dict]:
     """Keep markets with a YES outcome in [MIN_PROB, MAX_PROB] and enough
     liquidity. Returns the top MAX_MARKETS by liquidity descending."""
     out = []
     for m in markets:
-        price = yes_price(m)
+        price = normalise_price(yes_price(m))
         if price is None:
             continue
         if not (MIN_PROB <= price <= MAX_PROB):
@@ -291,6 +305,18 @@ def run_with_web_search(client: Anthropic, prompt: str) -> str:
     return ""
 
 
+def run_without_tools(client: Anthropic, prompt: str) -> str:
+    """Fallback: call Claude without web search tools."""
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return next(
+        (b.text for b in response.content if hasattr(b, "text") and b.text), ""
+    )
+
+
 def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
     for i, market in enumerate(markets, 1):
         title = market.get("question") or market.get("title") or "Unknown"
@@ -302,7 +328,19 @@ def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            analysis = json.loads(raw.strip())
+            raw = raw.strip()
+            if not raw:
+                # Web-search loop returned no text block — retry without tools
+                print("    ↺ Empty web-search response, retrying without tools…", flush=True)
+                raw = run_without_tools(client, build_prompt(market)).strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                raw = raw.strip()
+            if not raw:
+                raise ValueError("No text content returned from Claude")
+            analysis = json.loads(raw)
         except Exception as exc:
             print(f"    ⚠ Analysis error: {exc}", file=sys.stderr)
             analysis = {"claude_prob": None, "reasoning": str(exc), "edge_direction": "FAIR"}
@@ -436,7 +474,7 @@ def main() -> None:
         print(BOLD + YELLOW + "\n[DEMO MODE] Using mock market data." + RESET)
         markets = list(DEMO_MARKETS)          # don't mutate the module-level list
         for m in markets:
-            m["_top_price"] = yes_price(m)
+            m["_top_price"] = normalise_price(yes_price(m))
             m["_end_date"]  = resolve_date(m)
         markets = [m for m in markets if m["_top_price"] is not None]
     else:
@@ -451,6 +489,23 @@ def main() -> None:
                 "residential/non-datacenter IP."
             )
         print(f"  Retrieved {len(raw_markets)} markets.")
+
+        # ── Diagnostic: show raw price data for first 20 markets ──────────────
+        print(f"\n{DIM}  Diagnostic — first 20 raw markets (before filter):{RESET}")
+        print(f"  {'#':>3}  {'YES price':>12}  {'norm':>6}  {'outcomes':<20}  {'outcomePrices':<30}  question")
+        print("  " + "─" * 110)
+        for di, dm in enumerate(raw_markets[:20], 1):
+            raw_p    = yes_price(dm)
+            norm_p   = normalise_price(raw_p)
+            outcomes = str(dm.get("outcomes", ""))[:18]
+            op       = str(dm.get("outcomePrices") or dm.get("outcome_prices", ""))[:28]
+            q        = (dm.get("question") or dm.get("title") or "")[:50]
+            raw_str  = f"{raw_p:8.4f}" if raw_p is not None else "    None"
+            norm_str = f"{norm_p:.4f}" if norm_p is not None else "  None"
+            print(f"  {di:>3}  {raw_str:>12}  {norm_str:>6}  {outcomes:<20}  {op:<30}  {q}")
+        print()
+        # ─────────────────────────────────────────────────────────────────────
+
         markets = filter_markets(raw_markets)
         if not markets:
             print(
