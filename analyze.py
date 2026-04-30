@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Polymarket CLOB Market Analyzer
-Fetches active markets, filters for high-confidence outcomes (80-95%),
-uses Claude to estimate true probability, and surfaces potential edges.
+Fetches active markets, filters for high-confidence YES outcomes (80-95%),
+uses Claude + live web search to estimate true probability, surfaces edges.
 
 Usage:
-    python analyze.py          # live scan (requires network access to Polymarket)
-    python analyze.py --demo   # use mock market data (useful for testing)
+    python analyze.py          # live scan (requires Polymarket network access)
+    python analyze.py --demo   # mock markets for testing
 """
 
 import os
@@ -16,90 +16,102 @@ import time
 import textwrap
 import argparse
 import requests
+from datetime import datetime, timezone, timedelta
 from anthropic import Anthropic
 
-# ── Config ──────────────────────────────────────────────────────────────────
-GAMMA_API   = "https://gamma-api.polymarket.com"
-MODEL       = "claude-sonnet-4-20250514"
-MIN_PROB    = 0.80
-MAX_PROB    = 0.95
-MIN_LIQUID  = 1_000    # USD notional liquidity floor
-MAX_MARKETS = 6        # cap how many we send to Claude (API cost / latency)
-BET_SIZE    = 10.0     # hypothetical bet in USD
+# ── Config ────────────────────────────────────────────────────────────────────
+GAMMA_API           = "https://gamma-api.polymarket.com"
+MODEL               = "claude-sonnet-4-20250514"
+MIN_PROB            = 0.80
+MAX_PROB            = 0.95
+MIN_LIQUID          = 1_000     # USD liquidity floor
+MAX_MARKETS         = 6         # cap sent to Claude
+BET_SIZE            = 10.0      # hypothetical bet (USD)
+MAX_MONTHS_TO_CLOSE = 6         # skip markets resolving more than this far out
 
-# ── ANSI colours ─────────────────────────────────────────────────────────────
-RESET   = "\033[0m"
-BOLD    = "\033[1m"
-DIM     = "\033[2m"
-GREEN   = "\033[32m"
-YELLOW  = "\033[33m"
-RED     = "\033[31m"
-CYAN    = "\033[36m"
-WHITE   = "\033[97m"
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+RED    = "\033[31m"
+CYAN   = "\033[36m"
+WHITE  = "\033[97m"
 
 
-# ── Mock data (used with --demo) ──────────────────────────────────────────────
+# ── Mock data (--demo mode) ───────────────────────────────────────────────────
 DEMO_MARKETS = [
     {
-        "question": "Will the Fed cut interest rates in June 2025?",
-        "description": (
+        "question":      "Will the Fed cut interest rates in June 2026?",
+        "description":   (
             "This market resolves YES if the Federal Reserve announces a cut to the "
-            "federal funds rate target range at its June 2025 FOMC meeting. Resolution "
-            "is based on the official FOMC statement."
+            "federal funds rate target range at its June 2026 FOMC meeting."
         ),
-        "outcomePrices": ["0.87", "0.13"],
-        "liquidityNum": 450_000,
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.87", "0.13"]',
+        "liquidityNum":  450_000,
+        "endDate":       "2026-06-20T00:00:00Z",
     },
     {
-        "question": "Will Bitcoin price exceed $120,000 before July 1 2025?",
-        "description": (
-            "Resolves YES if BTC/USD spot price on any major exchange (Coinbase, Binance, "
-            "Kraken) closes above $120,000 at any point before 00:00 UTC July 1 2025."
+        "question":      "Will Bitcoin price exceed $120,000 before August 1 2026?",
+        "description":   (
+            "Resolves YES if BTC/USD spot price on any major exchange closes above "
+            "$120,000 at any point before 00:00 UTC August 1 2026."
         ),
-        "outcomePrices": ["0.82", "0.18"],
-        "liquidityNum": 1_200_000,
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.82", "0.18"]',
+        "liquidityNum":  1_200_000,
+        "endDate":       "2026-08-01T00:00:00Z",
     },
     {
-        "question": "Will Elon Musk remain CEO of Tesla through end of Q2 2025?",
-        "description": (
-            "Resolves YES if Elon Musk holds the title of CEO of Tesla, Inc. on June 30, "
-            "2025 as reported by Tesla's official communications or SEC filings."
-        ),
-        "outcomePrices": ["0.93", "0.07"],
-        "liquidityNum": 85_000,
-    },
-    {
-        "question": "Will the US unemployment rate stay below 4.5% through June 2025?",
-        "description": (
+        "question":      "Will the US unemployment rate stay below 4.5% through June 2026?",
+        "description":   (
             "Resolves YES if every BLS monthly unemployment report published through "
-            "June 2025 shows the U-3 unemployment rate below 4.5%."
+            "June 2026 shows the U-3 unemployment rate below 4.5%."
         ),
-        "outcomePrices": ["0.91", "0.09"],
-        "liquidityNum": 320_000,
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.91", "0.09"]',
+        "liquidityNum":  320_000,
+        "endDate":       "2026-06-30T00:00:00Z",
     },
     {
-        "question": "Will SpaceX Starship complete an orbital flight in 2025?",
-        "description": (
-            "Resolves YES if SpaceX's Starship vehicle achieves a trajectory that "
-            "reaches orbital altitude (>100km) and completes at least one full orbit "
-            "before reentry, prior to December 31 2025."
+        "question":      "Will SpaceX Starship complete an orbital flight in 2026?",
+        "description":   (
+            "Resolves YES if SpaceX's Starship vehicle achieves orbital altitude and "
+            "completes at least one full orbit before December 31 2026."
         ),
-        "outcomePrices": ["0.85", "0.15"],
-        "liquidityNum": 2_100_000,
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.85", "0.15"]',
+        "liquidityNum":  2_100_000,
+        "endDate":       "2026-12-31T00:00:00Z",
     },
     {
-        "question": "Will Apple release a foldable iPhone by end of 2025?",
-        "description": (
+        "question":      "Will Apple release a foldable iPhone by end of 2026?",
+        "description":   (
             "Resolves YES if Apple officially announces and begins shipping a foldable "
-            "form-factor iPhone device to consumers before December 31 2025."
+            "form-factor iPhone device to consumers before December 31 2026."
         ),
-        "outcomePrices": ["0.83", "0.17"],
-        "liquidityNum": 175_000,
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.83", "0.17"]',
+        "liquidityNum":  175_000,
+        "endDate":       "2026-12-31T00:00:00Z",
+    },
+    {
+        "question":      "Will Nvidia stock exceed $200 before July 2026?",
+        "description":   (
+            "Resolves YES if NVDA closes above $200.00 on any trading day before "
+            "July 1 2026 as reported by major US exchanges."
+        ),
+        "outcomes":      '["Yes", "No"]',
+        "outcomePrices": '["0.88", "0.12"]',
+        "liquidityNum":  890_000,
+        "endDate":       "2026-07-01T00:00:00Z",
     },
 ]
 
 
-# ── Polymarket API helpers ───────────────────────────────────────────────────
+# ── Polymarket API helpers ────────────────────────────────────────────────────
 
 def fetch_markets(limit: int = 300) -> list[dict]:
     """Pull active markets from the Gamma metadata API."""
@@ -113,17 +125,42 @@ def fetch_markets(limit: int = 300) -> list[dict]:
     return data.get("markets", data.get("data", []))
 
 
-def best_price(market: dict) -> float | None:
-    """Return the highest outcome price (YES/top token) in [0,1]."""
-    outcomes_raw = market.get("outcomePrices") or market.get("outcome_prices")
-    if not outcomes_raw:
-        return None
+def _parse_float_list(raw) -> list[float]:
+    """Parse a JSON string or list into a list of floats."""
+    if raw is None:
+        return []
+    lst = json.loads(raw) if isinstance(raw, str) else list(raw)
+    return [float(x) for x in lst if x is not None]
+
+
+def yes_price(market: dict) -> float | None:
+    """Return the probability of the YES outcome specifically.
+
+    Polymarket binary markets have parallel `outcomes` and `outcomePrices` arrays.
+    We find the index of "Yes" by name and return that price.
+    Falls back to index 0 (Polymarket convention) when outcome labels are absent.
+    Returns None if prices can't be parsed or no valid YES token is found.
+    """
     try:
-        prices = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-        floats = [float(p) for p in prices if p is not None]
-        return max(floats) if floats else None
+        prices = _parse_float_list(market.get("outcomePrices") or market.get("outcome_prices"))
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
+
+    if not prices:
+        return None
+
+    outcomes_raw = market.get("outcomes")
+    if outcomes_raw:
+        try:
+            names = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else list(outcomes_raw)
+            for i, name in enumerate(names):
+                if str(name).strip().lower() in ("yes", "true", "y", "1"):
+                    return prices[i] if i < len(prices) else None
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Polymarket convention: for binary markets the first token is always YES
+    return prices[0]
 
 
 def liquidity_usd(market: dict) -> float:
@@ -137,86 +174,162 @@ def liquidity_usd(market: dict) -> float:
     return 0.0
 
 
+def resolve_date(market: dict) -> datetime | None:
+    """Parse the market resolution/end date as a UTC-aware datetime."""
+    for key in ("endDate", "endDateIso", "resolutionDate", "end_date"):
+        raw = market.get(key)
+        if raw:
+            try:
+                dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
 def filter_markets(markets: list[dict]) -> list[dict]:
-    """Keep markets whose top outcome sits in [MIN_PROB, MAX_PROB] with enough liquidity."""
-    out = []
+    """Keep markets that:
+    - have a YES outcome priced in [MIN_PROB, MAX_PROB]
+    - have enough liquidity
+    - resolve within MAX_MONTHS_TO_CLOSE months (skips far-future markets)
+    - haven't already resolved (end date in the past)
+    """
+    now     = datetime.now(timezone.utc)
+    cutoff  = now + timedelta(days=MAX_MONTHS_TO_CLOSE * 30)
+    out     = []
+
     for m in markets:
-        price = best_price(m)
+        price = yes_price(m)
         if price is None:
             continue
         if not (MIN_PROB <= price <= MAX_PROB):
             continue
         if liquidity_usd(m) < MIN_LIQUID:
             continue
+
+        end = resolve_date(m)
+        if end is not None:
+            if end < now:
+                continue      # already expired
+            if end > cutoff:
+                continue      # too far out to analyse meaningfully
+
         m["_top_price"] = price
+        m["_end_date"]  = end
         out.append(m)
+
     out.sort(key=lambda m: m["_top_price"], reverse=True)
     return out[:MAX_MARKETS]
 
 
-# ── Claude analysis ──────────────────────────────────────────────────────────
+# ── Claude + web search ────────────────────────────────────────────────────────
 
 def build_prompt(market: dict) -> str:
     title    = market.get("question") or market.get("title") or "Unknown"
     criteria = market.get("description") or market.get("resolutionCriteria") or "Not provided"
-    criteria = textwrap.shorten(criteria, width=800, placeholder="…")
+    criteria = textwrap.shorten(criteria, width=600, placeholder="…")
     price    = market["_top_price"]
+    end_dt   = market.get("_end_date")
+    end_str  = end_dt.strftime("%Y-%m-%d") if end_dt else "unknown"
 
-    return f"""You are a sharp prediction-market analyst. A binary market is currently pricing the top outcome at {price:.0%} implied probability.
+    return f"""You are a sharp prediction-market analyst with live web search access.
 
-Market: {title}
+Market question: {title}
 
-Resolution criteria:
-{criteria}
+Resolution criteria: {criteria}
 
+Resolution date: {end_str}
+Market's current YES probability: {price:.1%}
 Today's date: {time.strftime('%Y-%m-%d')}
 
-Your task:
-1. Give your own probability estimate (0-100%) for the top outcome resolving YES.
-2. Explain your reasoning in 2-3 sentences — be direct and specific about the key factors.
-3. Classify whether there is a meaningful edge vs the market price.
+INSTRUCTIONS:
+1. Use web search to find current news, data, or recent developments directly relevant to this market. Search for specific facts that move the probability.
+2. Based on what you find, estimate the true probability (0–100%) that this market resolves YES.
+3. Explain your reasoning in 2–3 sentences, citing the evidence you found.
+4. Compare your estimate to the market price and classify the edge.
 
-Respond ONLY with valid JSON in this exact shape (no markdown fences, no extra keys):
+After searching, respond ONLY with valid JSON — no markdown fences, no extra keys:
 {{
   "claude_prob": <float between 0 and 1>,
-  "reasoning": "<2-3 sentence string>",
+  "reasoning": "<2-3 sentence string citing what you found>",
   "edge_direction": "OVER" | "UNDER" | "FAIR"
 }}
 
 Definitions:
-- "OVER"  = true probability is HIGHER than market price (market is underpriced/cheap — buy signal)
-- "UNDER" = true probability is LOWER than market price (market is overpriced/expensive — avoid)
-- "FAIR"  = roughly in line with market price, no meaningful edge"""
+- "OVER"  = your estimate is HIGHER than the market (market is cheap — potential buy)
+- "UNDER" = your estimate is LOWER  (market is expensive — avoid)
+- "FAIR"  = roughly aligned, no meaningful edge"""
+
+
+def run_with_web_search(client: Anthropic, prompt: str) -> str:
+    """Call Claude with the built-in server-side web_search tool.
+
+    web_search_20260209 is a server-side tool: Anthropic executes the searches
+    and embeds results in the response content automatically — no tool_result
+    messages are needed from the client. We just loop on pause_turn (server
+    iteration limit) until we get end_turn.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    tools    = [{"type": "web_search_20260209", "name": "web_search"}]
+
+    for _ in range(6):   # safety cap for pause_turn loops
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
+
+        if response.stop_reason == "end_turn":
+            return next(
+                (b.text for b in response.content if hasattr(b, "text") and b.text),
+                ""
+            )
+
+        if response.stop_reason == "pause_turn":
+            # Server-side loop hit its iteration limit; re-send to resume.
+            # We do NOT add a new user message — the API detects the trailing
+            # server_tool_use block and resumes the search loop automatically.
+            messages = [
+                {"role": "user",      "content": prompt},
+                {"role": "assistant", "content": response.content},
+            ]
+            continue
+
+        # Unexpected stop (max_tokens, refusal, etc.) — return whatever text exists
+        return next(
+            (b.text for b in response.content if hasattr(b, "text") and b.text),
+            ""
+        )
+
+    return ""
 
 
 def analyze_markets(client: Anthropic, markets: list[dict]) -> list[dict]:
     for i, market in enumerate(markets, 1):
         title = market.get("question") or market.get("title") or "Unknown"
-        print(f"  [{i}/{len(markets)}] {title[:72]}…", flush=True)
+        print(f"  [{i}/{len(markets)}] {title[:70]}…", flush=True)
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=512,
-                messages=[{"role": "user", "content": build_prompt(market)}],
-            )
-            raw = response.content[0].text.strip()
-            # Strip markdown fences if Claude adds them
+            raw = run_with_web_search(client, build_prompt(market))
+            # Strip accidental markdown fences
             if raw.startswith("```"):
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
             analysis = json.loads(raw.strip())
         except Exception as exc:
-            print(f"    ⚠ Claude error: {exc}", file=sys.stderr)
+            print(f"    ⚠ Analysis error: {exc}", file=sys.stderr)
             analysis = {"claude_prob": None, "reasoning": str(exc), "edge_direction": "FAIR"}
 
         market["_analysis"] = analysis
-        time.sleep(0.4)
+        time.sleep(0.5)
 
     return markets
 
 
-# ── Terminal dashboard ───────────────────────────────────────────────────────
+# ── Terminal dashboard ────────────────────────────────────────────────────────
 
 def prob_bar(value: float, width: int = 22) -> str:
     filled = round(value * width)
@@ -224,7 +337,7 @@ def prob_bar(value: float, width: int = 22) -> str:
 
 
 def expected_value(market_prob: float, claude_prob: float, bet: float) -> float:
-    """EV of a $bet on YES at market_prob binary odds."""
+    """EV of a $bet on YES at binary market odds."""
     payout_if_yes = bet / market_prob
     return claude_prob * (payout_if_yes - bet) - (1 - claude_prob) * bet
 
@@ -234,18 +347,19 @@ def edge_color(direction: str) -> str:
 
 
 def render_dashboard(markets: list[dict]) -> None:
-    W   = 88
+    W   = 90
     SEP = "─" * W
 
     print()
     print(BOLD + CYAN + "╔" + "═" * (W - 2) + "╗" + RESET)
-    header = "  POLYMARKET CLOB ANALYZER  ·  Paper Trading Only — No Bets Are Placed  "
-    print(BOLD + CYAN + "║" + header + " " * (W - 2 - len(header)) + "║" + RESET)
+    hdr = "  POLYMARKET CLOB ANALYZER  ·  Paper Trading Only — No Bets Are Placed  "
+    print(BOLD + CYAN + "║" + hdr + " " * (W - 2 - len(hdr)) + "║" + RESET)
     print(BOLD + CYAN + "╚" + "═" * (W - 2) + "╝" + RESET)
     print(f"{DIM}  {time.strftime('%Y-%m-%d %H:%M:%S')}   "
-          f"Filter: {MIN_PROB:.0%}–{MAX_PROB:.0%} top outcome   "
+          f"Filter: {MIN_PROB:.0%}–{MAX_PROB:.0%} YES   "
+          f"Max horizon: {MAX_MONTHS_TO_CLOSE}mo   "
           f"Model: {MODEL}   "
-          f"Hypothetical bet: ${BET_SIZE:.0f}{RESET}")
+          f"Bet size: ${BET_SIZE:.0f}{RESET}")
     print()
 
     edge_markets = [m for m in markets if m["_analysis"].get("edge_direction") != "FAIR"]
@@ -259,29 +373,29 @@ def render_dashboard(markets: list[dict]) -> None:
         direction = analysis.get("edge_direction", "FAIR")
         has_edge  = direction != "FAIR"
         color     = edge_color(direction)
+        end_dt    = market.get("_end_date")
+        end_str   = end_dt.strftime("%Y-%m-%d") if end_dt else "?"
 
         flag = f"  {BOLD}{GREEN}◆ EDGE FOUND{RESET}" if has_edge else ""
         print(BOLD + f"  #{idx}  " + WHITE + BOLD + title[:W - 8] + RESET + flag)
         print("  " + SEP)
+        print(f"  {DIM}Resolves: {end_str}   Liquidity: ${liquidity_usd(market):,.0f}{RESET}")
 
-        # Probability rows
-        print(f"  Market price  {CYAN}{mkt_prob:5.1%}{RESET}  {CYAN}{prob_bar(mkt_prob)}{RESET}")
+        # Probability bars — always labelled YES so there's no ambiguity
+        print(f"  Market YES    {CYAN}{mkt_prob:5.1%}{RESET}  {CYAN}{prob_bar(mkt_prob)}{RESET}")
         if c_prob is not None:
             diff     = c_prob - mkt_prob
             diff_str = f"{'+' if diff >= 0 else ''}{diff:.1%}"
-            print(f"  Claude est.   {color}{c_prob:5.1%}{RESET}  {color}{prob_bar(c_prob)}{RESET}")
+            print(f"  Claude YES    {color}{c_prob:5.1%}{RESET}  {color}{prob_bar(c_prob)}{RESET}")
             print(f"  Delta         {color}{BOLD}{diff_str:>6}{RESET}  ({direction})")
 
-            ev      = expected_value(mkt_prob, c_prob, BET_SIZE)
-            ev_str  = f"{'+'if ev>=0 else ''}{ev:.2f}"
-            ev_col  = GREEN if ev > 0.10 else (RED if ev < -0.10 else DIM)
-            liq_str = f"${liquidity_usd(market):,.0f}" if liquidity_usd(market) else "N/A"
-            print(f"  ${BET_SIZE:.0f} bet EV    {ev_col}{BOLD}${ev_str}{RESET}  "
-                  f"{DIM}(liquidity: {liq_str}){RESET}")
+            ev     = expected_value(mkt_prob, c_prob, BET_SIZE)
+            ev_str = f"{'+'if ev>=0 else ''}{ev:.2f}"
+            ev_col = GREEN if ev > 0.10 else (RED if ev < -0.10 else DIM)
+            print(f"  ${BET_SIZE:.0f} bet EV    {ev_col}{BOLD}${ev_str}{RESET}")
         else:
-            print(f"  Claude est.   {DIM}N/A{RESET}")
+            print(f"  Claude YES    {DIM}N/A{RESET}")
 
-        # Reasoning block
         wrapped = textwrap.fill(
             reasoning, width=W - 4, initial_indent="    ", subsequent_indent="    "
         )
@@ -289,7 +403,7 @@ def render_dashboard(markets: list[dict]) -> None:
         print(f"{DIM}{wrapped}{RESET}")
         print()
 
-    # ── Summary ──────────────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
     print(BOLD + CYAN + "  SUMMARY" + RESET)
     print("  " + SEP)
     print(f"  Markets analyzed : {len(markets)}")
@@ -302,7 +416,7 @@ def render_dashboard(markets: list[dict]) -> None:
             direction = m["_analysis"].get("edge_direction", "?")
             c_prob    = m["_analysis"].get("claude_prob")
             mkt_prob  = m["_top_price"]
-            title     = (m.get("question") or m.get("title") or "Unknown")[:60]
+            title     = (m.get("question") or m.get("title") or "Unknown")[:58]
             diff      = (c_prob - mkt_prob) if c_prob is not None else 0
             ev        = expected_value(mkt_prob, c_prob, BET_SIZE) if c_prob is not None else 0
             col       = GREEN if direction == "OVER" else RED
@@ -313,14 +427,14 @@ def render_dashboard(markets: list[dict]) -> None:
     print()
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Polymarket CLOB market analyzer")
     p.add_argument(
         "--demo",
         action="store_true",
-        help="Use mock market data instead of live API (useful when Polymarket API is unreachable)",
+        help="Use mock market data (useful when Polymarket API is IP-blocked)",
     )
     return p.parse_args()
 
@@ -336,10 +450,10 @@ def main() -> None:
 
     if args.demo:
         print(BOLD + YELLOW + "\n[DEMO MODE] Using mock market data." + RESET)
-        markets = DEMO_MARKETS
-        # Pre-compute _top_price and _liquidity for demo markets
+        markets = list(DEMO_MARKETS)          # don't mutate the module-level list
         for m in markets:
-            m["_top_price"] = best_price(m)
+            m["_top_price"] = yes_price(m)
+            m["_end_date"]  = resolve_date(m)
         markets = [m for m in markets if m["_top_price"] is not None]
     else:
         print(BOLD + CYAN + "\nFetching active Polymarket markets…" + RESET, flush=True)
@@ -349,21 +463,24 @@ def main() -> None:
             sys.exit(
                 f"Failed to fetch markets: {exc}\n\n"
                 "If you're getting a 403, Polymarket may be blocking this IP.\n"
-                "Try running with --demo to verify the tool works, then re-run\n"
-                "from your local machine or with a residential IP."
+                "Run with --demo to verify the tool works, or re-run from a\n"
+                "residential/non-datacenter IP."
             )
         print(f"  Retrieved {len(raw_markets)} markets.")
         markets = filter_markets(raw_markets)
         if not markets:
+            cutoff_str = (datetime.now(timezone.utc) + timedelta(days=MAX_MONTHS_TO_CLOSE * 30)
+                          ).strftime("%Y-%m-%d")
             print(
-                f"\nNo markets matched the filter ({MIN_PROB:.0%}–{MAX_PROB:.0%} top outcome, "
-                f"liquidity ≥ ${MIN_LIQUID:,}).\n"
-                "Try lowering MIN_LIQUID or widening the probability band in the config section.\n"
+                f"\nNo markets matched (YES {MIN_PROB:.0%}–{MAX_PROB:.0%}, "
+                f"liquidity ≥ ${MIN_LIQUID:,}, resolves before {cutoff_str}).\n"
+                "Try lowering MIN_LIQUID, widening the probability band, or "
+                "raising MAX_MONTHS_TO_CLOSE in the config section.\n"
             )
             return
         print(f"  {len(markets)} markets passed filter.")
 
-    print(BOLD + CYAN + f"\nRunning Claude analysis ({MODEL})…" + RESET, flush=True)
+    print(BOLD + CYAN + f"\nRunning Claude analysis with web search ({MODEL})…" + RESET, flush=True)
     analyzed = analyze_markets(client, markets)
     render_dashboard(analyzed)
 
